@@ -1,6 +1,7 @@
 """挑战玩法的本地排期与初始化；关卡取自安装包配置。"""
 
 from functools import lru_cache
+import datetime
 import random
 import time
 
@@ -8,7 +9,7 @@ from .gameplay_protocol import read_client_data
 from .polyhedron_game import polyhedron_data
 from .equip_exploration import exploration_pushes
 from .battle_progress import progress, tower_progress
-from .battle_rewards import spend_items
+from .battle_rewards import spend_items, grant_rewards
 from .server_clock import business_day
 from .activity_periods import period_settings, period_window
 
@@ -25,11 +26,13 @@ def challenge_catalog() -> dict:
         end
         r.mythic=rows('MythicNormalCfg')
         r.mythic_stages=require('BattleMythicStageCfg').all
+        -- 与官服 44007.superiority_affix_list 对齐：火增伤 10、水增伤 5、硬化 1。
         r.mythic_affixes={}
-        for _,id in ipairs({101,102,103}) do
+        for _,row in ipairs({{412,10,0},{413,5,0},{183,1,3}}) do
+            local id,level,kind=row[1],row[2],row[3]
             local affix=require('AffixTypeCfg')[id]
-            assert(affix and affix.max_level>=1)
-            r.mythic_affixes[#r.mythic_affixes+1]={id=id,level=1,type=0}
+            assert(affix and affix.max_level>=level)
+            r.mythic_affixes[#r.mythic_affixes+1]={id=id,level=level,type=kind}
         end
         r.final=rows('MythicFinalCfg')
         r.boss=rows('BossChallengeCfg')
@@ -82,6 +85,262 @@ def _roll_enchant_slot(current: list, index: int) -> None:
     candidates = [group['id'] for group in _enchant_groups() if group['id'] not in current]
     if candidates:
         current[index] = random.choice(candidates)
+
+
+def seizure_affix_ids(stage_id: int) -> list[int]:
+    """按当日关卡的属性顺序取官方介质攫取三件套增益。
+
+    9201~9208 是八种属性偏移场，9215~9222 是对应的屏蔽无效化，
+    9210 是死徒；客户端只认 ActivityAffixPoolCfg 里的这三个 ID。
+    """
+    stages = challenge_catalog()['seizure']
+    element = stages.index(stage_id) % 8 if stage_id in stages else 0
+    return [9201 + element, 9215 + element, 9210]
+
+
+def next_seizure_affix_refresh() -> int:
+    """下一个周一/周四/周六 05:00，和官服增益轮换一致。"""
+    now = datetime.datetime.now()
+    for offset in range(8):
+        candidate = (now + datetime.timedelta(days=offset)).replace(
+            hour=5, minute=0, second=0, microsecond=0)
+        if candidate > now and candidate.weekday() in (0, 3, 5):
+            return int(candidate.timestamp())
+    return int(now.timestamp()) + 86400
+
+
+def _seizure_effective_dt(now: int | None = None) -> datetime.datetime:
+    """05:00 前仍算前一天，和每日/每期刷新口径一致。"""
+    now = int(time.time()) if now is None else int(now)
+    value = datetime.datetime.fromtimestamp(now)
+    if value.hour < 5:
+        value -= datetime.timedelta(days=1)
+    return value
+
+
+def seizure_week_key(now: int | None = None) -> int:
+    """返回本期开始时间：最近一个周四 05:00（官服周常周四换期）。"""
+    value = _seizure_effective_dt(now)
+    days_since_thursday = (value.weekday() - 3) % 7
+    thursday = (value - datetime.timedelta(days=days_since_thursday)).replace(
+        hour=5, minute=0, second=0, microsecond=0)
+    return int(thursday.timestamp())
+
+
+def next_seizure_week_refresh(now: int | None = None) -> int:
+    """下一个周四 05:00；官服介质攫取页面底部按这个周期刷新。"""
+    return seizure_week_key(now) + 7 * 86400
+
+
+def seizure_challenge_rate(now: int | None = None) -> float:
+    """周六/周日 05:00 后 1.2 倍，其余时间 1.0 倍。"""
+    return 1.2 if _seizure_effective_dt(now).weekday() in (5, 6) else 1.0
+
+
+def seizure_rewards() -> list:
+    """读取客户端介质攫取积分奖励档位，避免硬编码分数和道具。"""
+    return read_client_data('''(function()
+        local c=require('EquipSeizurePointRewardCfg')
+        local t={}
+        for _,id in ipairs(c.all) do t[#t+1]=c[id] end
+        return t
+    end)()''')
+
+
+def seizure_state(user: dict, now: int | None = None) -> dict:
+    """惰性重置今日最高分和本期累计分，并返回介质攫取存档。"""
+    now = int(time.time()) if now is None else int(now)
+    state = user.setdefault('equip_seizure', {})
+    state.setdefault('today_max_score', 0)
+    state.setdefault('sum_score', 0)
+    state.setdefault('got_reward_id_list', [])
+    state.setdefault('last_battle_id', 0)
+    state.setdefault('stage_id', 0)
+    day = business_day(now)
+    week = seizure_week_key(now)
+    if state.get('day') != day:
+        state['day'] = day
+        state['today_max_score'] = 0
+    if state.get('week_key') != week:
+        state['week_key'] = week
+        state['sum_score'] = 0
+        state['got_reward_id_list'] = []
+    return state
+
+
+def calc_equip_seizure_score(wave_count: int = 0, enemy_dead: int = 0,
+                             battle_time_ms: int = 0, explicit_score: int = 0,
+                             is_win: bool = False) -> tuple[int, int]:
+    """按官方波次分计算介质攫取基础分。
+
+    官服 42 波未击杀 Boss 的结算为 19,080（周日 1.2 倍），即基础 15,900：
+    每波 300 分，20/30/40 波各追加 1,000/1,100/1,200 分。
+    11 波 3,300、31 波 11,400、39 波 16,560 也都与这个口径吻合。
+    """
+    if explicit_score > 0:
+        return int(explicit_score), 0
+    if wave_count > 0:
+        waves = int(wave_count)
+    elif enemy_dead > 0:
+        if enemy_dead <= 91:
+            waves = max(1, int(round(enemy_dead / 4.8)))
+        else:
+            waves = max(1, int(round(19 + ((enemy_dead - 91) / 20.2) * 5)))
+    elif battle_time_ms > 0:
+        seconds = battle_time_ms / 1000.0 if battle_time_ms > 1000 else float(battle_time_ms)
+        waves = max(1, int(seconds / 15.0))
+    elif is_win:
+        waves = 40
+    else:
+        waves = 1
+    score = waves * 300
+    if waves >= 20:
+        score += 1000
+    if waves >= 30:
+        score += 1100
+    if waves >= 40:
+        score += 1200
+    return min(24000, max(200, score)), waves
+
+
+def seizure_wave_count(info: dict) -> int:
+    """从原生战斗报告读取到达波次。
+
+    14 号记录是关卡信息，第 2 项 42 是本关总波次，不是玩家到达波次；
+    15 号记录的第 2 项才是玩家实际到达波次（例如 39）。
+    若 15 号缺失，才退回用 14 号，并用总波次做上限。
+    """
+    if not isinstance(info, dict):
+        return 0
+
+    def _int_at(key):
+        values = info.get(key)
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            try:
+                return int(values[1])
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    total = _int_at('14')
+    reached = _int_at('15')
+    if reached > 0:
+        # 通关瞬间客户端可能上报“总波次+1”，用关卡总波次封顶。
+        if total > 0 and reached > total:
+            return total
+        if 1 <= reached <= 100:
+            return reached
+    if 0 < total <= 100:
+        return total
+    return 0
+
+
+def settle_equip_seizure(user: dict, battle: dict, result: int | None = None,
+                         info: dict | None = None, now: int | None = None) -> dict:
+    """写入介质攫取分数；今日只累计最高分，本期累计按刷新后的增量增加。"""
+    if not battle or battle.get('common', {}).get('type') != 53:
+        return {}
+    cached = battle.get('seizure_settlement')
+    if cached and cached.get('battle_id') == battle.get('id'):
+        return cached
+    reported = battle.get('reported') or {}
+    result = int(reported.get('result', 0) if result is None else result)
+    if info is None:
+        info = reported.get('info') or {}
+    now = int(time.time()) if now is None else int(now)
+    state = seizure_state(user, now)
+    score = 0
+    waves = 0
+    if result == 1:
+        raw_score, waves = calc_equip_seizure_score(
+            wave_count=seizure_wave_count(info),
+            enemy_dead=int(info.get('11') or 0),
+            battle_time_ms=int(info.get('2') or 0),
+            explicit_score=int(info.get('score') or info.get('point') or 0),
+            is_win=True)
+        score = int(round(raw_score * seizure_challenge_rate(now)))
+        old_today = int(state.get('today_max_score') or 0)
+        state['today_max_score'] = max(old_today, score)
+        state['sum_score'] = int(state.get('sum_score') or 0) + max(0, score - old_today)
+    state['last_battle_id'] = int(battle.get('id') or 0)
+    state['last_score'] = score
+    state['last_battle_time'] = now
+    battle['seizure_settlement'] = {
+        'battle_id': int(battle.get('id') or 0), 'score': score,
+        'raw_score': int(score / seizure_challenge_rate(now)) if score else 0,
+        'est_waves': waves, 'is_valid': result == 1,
+        'today_max_score': int(state.get('today_max_score') or 0),
+        'sum_score': int(state.get('sum_score') or 0),
+        'challenge_rate': seizure_challenge_rate(now),
+    }
+    print(f"[介质攫取结算] 战斗={battle.get('id')} 波次={waves} "
+          f"基础={battle['seizure_settlement']['raw_score']} "
+          f"倍率={battle['seizure_settlement']['challenge_rate']} 本次={score} "
+          f"今日最高={state.get('today_max_score')} 本期累计={state.get('sum_score')}")
+    return battle['seizure_settlement']
+
+
+def restore_equip_seizure_battle(user: dict, now: int | None = None) -> None:
+    """把修复前已打完但未计分的最近一局补写进存档，且同一局只补一次。"""
+    session = user.get('battle_session') or {}
+    if session.get('common', {}).get('type') != 53:
+        return
+    reported = session.get('reported') or {}
+    if reported.get('result') != 1:
+        return
+    state = user.get('equip_seizure') or {}
+    if int(state.get('last_battle_id') or 0) == int(session.get('id') or 0):
+        return
+    finished = (session.get('settlement') or {}).get('battle_result', {}).get('timestamp')
+    finished = int(finished or session.get('started') or now or time.time())
+    if business_day(finished) != business_day(int(time.time()) if now is None else int(now)):
+        return
+    settle_equip_seizure(user, session, now=finished)
+
+
+def seizure_data(user: dict, now: int | None = None) -> dict:
+    """构造 sc_35011，分数和领奖状态全部来自玩家存档而不是常量。"""
+    now = int(time.time()) if now is None else int(now)
+    restore_equip_seizure_battle(user, now)
+    state = seizure_state(user, now)
+    stages = challenge_catalog()['seizure']
+    stage_id = int(state.get('stage_id') or stages[0])
+    state['stage_id'] = stage_id
+    return {
+        'stage_id': stage_id,
+        'challenge_rate': seizure_challenge_rate(now),
+        'affix_info': {'affix_id_list': seizure_affix_ids(stage_id),
+                       'refresh_timestamp': next_seizure_affix_refresh()},
+        'today_max_score': int(state.get('today_max_score') or 0),
+        'sum_score': int(state.get('sum_score') or 0),
+        'got_reward_id_list': [int(value) for value in state.get('got_reward_id_list') or []],
+        'refresh_timestamp': next_seizure_week_refresh(now),
+    }
+
+
+def claim_equip_seizure_rewards(user: dict, id_list: list, now: int | None = None) -> dict:
+    """按当期累计分校验档位并发放奖励，单领和一键领取共用这套逻辑。"""
+    state = seizure_state(user, now)
+    reward_cfg = {int(row['id']): row for row in seizure_rewards()}
+    requested = [int(value) for value in (id_list or []) if value]
+    claimed = {int(value) for value in state.get('got_reward_id_list') or []}
+    totals = {}
+    for reward_id in requested:
+        row = reward_cfg.get(reward_id)
+        if not row or reward_id in claimed:
+            continue
+        if int(state.get('sum_score') or 0) < int(row.get('need') or 0):
+            continue
+        for item, amount in row.get('reward_item_list') or []:
+            item, amount = int(item), int(amount)
+            if item and amount:
+                totals[item] = totals.get(item, 0) + amount
+        claimed.add(reward_id)
+    rewards = [{'id': item, 'num': amount} for item, amount in totals.items()]
+    if rewards:
+        grant_rewards(user, rewards)
+    state['got_reward_id_list'] = sorted(claimed)
+    return {'result': 0, 'reward_list': rewards}
 
 
 def _enchant_state(user: dict, now: int | None = None) -> dict:
@@ -157,7 +416,7 @@ def boss_area(user: dict, area_id=None) -> dict:
                 return area
             if area_id is not None:
                 raise ValueError('梦境周期无效')
-    if user.get('account_template') == 'normal':
+    if user.get('account_template') == 'normal' and not user.get('official_unlock'):
         level = user.get('level', 1)
         return next((row for row in catalog if row['level'][0] <= level <= row['level'][1]), catalog[0])
     return next(row for row in catalog if row['range_id'] == 4)
@@ -174,6 +433,53 @@ def boss_group_ids(user: dict, area: dict) -> list[int]:
         groups.remove(selected)
         groups.insert(0, selected)
     return groups
+
+
+def boss_advance(user: dict) -> dict:
+    """取当前扭曲梦境难度；45202 选 102 即扭曲梦境Ⅱ，旧档的 2 也按Ⅱ处理。"""
+    c = challenge_catalog()
+    raw = user.get('boss_advance_id', user.get('boss_mode', 0))
+    try:
+        selected = int(raw or 0)
+    except (TypeError, ValueError):
+        selected = 0
+    if selected not in (101, 102):
+        selected = 102 if selected == 2 else 101
+    return next(x for x in c['advance'] if x['id'] == selected)
+
+
+def boss_advance_pool(user: dict, advance: dict) -> list[dict]:
+    """扭曲梦境Ⅰ用 20001 段，Ⅱ用 30001 段；与官服 45101.boss_list 的 ID 对齐。"""
+    start = 20001 if advance['id'] == 101 else 30001
+    pool = [x for x in challenge_catalog()['advance_pool'] if start <= x['id'] < start + 100]
+    return pool[:advance['boss_nums']]
+
+
+@lru_cache(maxsize=1)
+def boss_point_configs() -> dict:
+    """词缀和关卡条件各自的分值；官服 30001 四词缀 4000 分/个 + 难度 7 基础 14000 = 30000。"""
+    return read_client_data('''(function()
+        local a=require('ActivityAffixPoolCfg')
+        local c=require('StageChallengeConditionPoolCfg')
+        local r={affix={},condition={}}
+        for k,v in pairs(a) do r.affix[tostring(k)]=tonumber(v.point) or 0 end
+        for _,v in ipairs(c) do r.condition[tostring(v.id)]=tonumber(v.point) or 0 end
+        return r
+    end)()''')
+
+
+def boss_challenge_score(user: dict, boss_id: int, advance: dict) -> int:
+    """按客户端 GetTotalPoint 同口径计算：难度基础分 + 已选词缀分 + 关卡条件分。"""
+    affix = (user.get('boss_affixes') or {}).get(str(boss_id), {})
+    difficulty = int(affix.get('diffculty_index') or 1)
+    points = advance.get('difficult_point') or []
+    base = int(points[difficulty - 1]) if 1 <= difficulty <= len(points) else 0
+    config = boss_point_configs()
+    affix_points = sum(config['affix'].get(str(x), 0)
+                       for x in affix.get('affix_index_list') or [])
+    condition_points = sum(config['condition'].get(str(x), 0)
+                           for x in affix.get('time_index_list') or [])
+    return base + affix_points + condition_points
 
 
 def boss_activity_options(user: dict) -> dict:
@@ -207,8 +513,9 @@ def boss_data(user: dict) -> list[tuple]:
     """初始化梦境普通与扭曲模式，所选层级保存在账号中。"""
     c = challenge_catalog()
     area = boss_area(user)
+    advance = boss_advance(user)
+    pool = boss_advance_pool(user, advance)
     active_groups = boss_group_ids(user, area)[:area['boss_nums']]
-    advance = next(x for x in c['advance'] if x['type'] == 2)
     groups = []
     for group_id in active_groups:
         stages = c['boss_groups'][str(group_id)]
@@ -219,16 +526,28 @@ def boss_data(user: dict) -> list[tuple]:
                        'last_heroes_cfg': user.get('boss_teams', {}).get(str(group_id), []),
                        'star_info': [{'stage_id': s, 'star_list': progress(user,10,s).get('stars', [])}
                                      for s in completed]})
+    bosses = []
+    for x in pool:
+        # 扭曲梦境战斗走 type 100，官方最高积分也记录在 100:stage_id 进度里。
+        completed = progress(user, 100, x['stage_id'])
+        affix = user.get('boss_affixes', {}).get(str(x['id']), {})
+        bosses.append({'id': x['id'], 'unlock_timestamp': 0,
+                       'max_point': completed.get('max_point', 0),
+                       'diffculty_index': affix.get('diffculty_index', 1),
+                       'last_heroes_cfg': user.get('boss_teams', {}).get(str(x['id']), []),
+                       'used_heroes': sorted(completed.get('last_heroes', [])),
+                       'affix_index_list': affix.get('affix_index_list', []),
+                       'time_index_list': affix.get('time_index_list', [])})
     return [
-        (45201, {'mode': user.get('boss_mode', 0), 'next_refresh_time': period_window('dream')[1],
+        (45201, {'mode': 2 if advance['id'] == 102 else 1,
+                 'next_refresh_time': period_window('dream')[1],
                  'difficulty_list': [x['id'] for x in c['advance']
-                                     if user.get('account_template') != 'normal' or x['open_condition'] <= user['level']]}),
+                                     if user.get('account_template') != 'normal' or user.get('official_unlock')
+                                     or x['open_condition'] <= user['level']]}),
         (45001, {'area_id': area['range_id'], 'use_times': 0,
-                 'boss_challenge_list': groups, 'receive_star_list': user.get('boss_star_rewards', [])}),
-        (45101, {'advance_id': advance['id'], 'boss_list': [
-            {'id': x['id'], 'unlock_timestamp': 0, 'max_point': 0, 'diffculty_index': 1,
-            **user.get('boss_affixes', {}).get(str(x['id']), {})}
-            for x in c['advance_pool'][:advance['boss_nums']]]}),
+                 'boss_challenge_list': groups, 'receive_star_list': user.get('boss_star_rewards') or []}),
+        (45101, {'advance_id': advance['id'], 'boss_list': bosses,
+                 'receive_point_list': user.get('boss_receive_points') or []}),
     ]
 
 
@@ -315,21 +634,149 @@ def rogue_team_data(user: dict) -> dict:
             'last_id': state.get('last_id', 0)}
 
 
-def core_data(user: dict) -> dict:
-    """按客户端配置顺序轮换迭代校验，预告下期并只恢复当期进度。"""
+@lru_cache(maxsize=1)
+def core_reward_catalog() -> dict:
+    """读取客户端迭代校验奖励表，任务 ID 与当前安装包版本保持一致。"""
+    rows = read_client_data('''(function()
+        local cfg=require('CoreVerificationRewardCfg')
+        local result={}
+        for _,id in ipairs(cfg.all) do
+            local row=cfg[id]
+            local rewards={}
+            for _,pair in ipairs(row.reward or {}) do
+                rewards[#rewards+1]={id=pair[1],num=pair[2]}
+            end
+            result[#result+1]={id=row.id,cycle=row.cycle,reward_type=row.reward_type,
+                               condition=row.condition,rewards=rewards}
+        end
+        return result
+    end)()''')
+    return {int(row['id']): {'id': int(row['id']), 'cycle': int(row['cycle'] or 0),
+                             'reward_type': int(row['reward_type'] or 0),
+                             'condition': row.get('condition'),
+                             'rewards': [{'id': int(x['id']), 'num': int(x['num'])}
+                                         for x in row.get('rewards') or []]}
+            for row in rows}
+
+
+def core_cycle_info() -> tuple[int, int, int]:
+    """按当前活动周期计算迭代校验的当期、下期与刷新时间。"""
     rows = challenge_catalog()['core']
     cycles = list(dict.fromkeys(row['cycle'] for row in rows))
     settings = period_settings()
     start, end = period_window('core', settings)
     cfg = settings['core']
     index = ((start - cfg['anchor']) // (cfg['hours'] * 3600)) % len(cycles)
-    cycle = cycles[index]
-    return {'now_cycle': cycle, 'next_cycle': cycles[(index + 1) % len(cycles)],
+    return cycles[index], cycles[(index + 1) % len(cycles)], end
+
+
+def core_claimed_task_ids(user: dict, cycle: int) -> list[int]:
+    """返回永久首通与当期已领取的任务 ID，供 sc_75009 标记已领。"""
+    state = user.get('core_verification_claimed') or {}
+    if not isinstance(state, dict):
+        return []
+    result = []
+    for key in ('0', str(int(cycle))):
+        for task_id in state.get(key) or []:
+            try:
+                result.append(int(task_id))
+            except (TypeError, ValueError):
+                continue
+    return sorted(set(result))
+
+
+def core_stage_records(user: dict, cycle: int) -> list[dict]:
+    """返回当期已通关的迭代校验关卡，包含 Boss 与难度。"""
+    return [row for row in challenge_catalog()['core']
+            if int(row['cycle']) == int(cycle)
+            and progress(user, 67, int(row['id'])).get('clear_times')]
+
+
+def claim_core_rewards(user: dict, reward_ids) -> list[dict]:
+    """按真实通关进度领取 75006 任务，返回实际发放的道具列表。"""
+    now_cycle, _, _ = core_cycle_info()
+    catalog = core_reward_catalog()
+    records = core_stage_records(user, now_cycle)
+    max_diff1 = max([int(row['difficult']) for row in records if int(row['boss_type']) == 1] or [0])
+    max_diff2 = max([int(row['difficult']) for row in records if int(row['boss_type']) == 2] or [0])
+    min_diff = min(max_diff1, max_diff2)
+    state = user.get('core_verification_claimed')
+    if not isinstance(state, dict):
+        state = {}
+        user['core_verification_claimed'] = state
+
+    granted = []
+    for raw_id in reward_ids or []:
+        try:
+            task_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        task = catalog.get(task_id)
+        if not task:
+            continue
+        reward_type = int(task['reward_type'])
+        task_cycle = int(task['cycle'])
+        if reward_type in (1, 2) and task_cycle != now_cycle:
+            continue
+        if reward_type not in (1, 2, 3, 4):
+            continue
+
+        claim_cycle = 0 if reward_type == 4 else now_cycle
+        claimed = state.setdefault(str(claim_cycle), [])
+        if task_id in claimed:
+            continue
+
+        can_claim = False
+        if reward_type == 1:
+            required = task_id % 10
+            can_claim = required > 0 and max_diff1 >= required
+        elif reward_type == 2:
+            required = task_id % 10
+            can_claim = required > 0 and max_diff2 >= required
+        elif reward_type == 3:
+            required = task_id - 1000
+            can_claim = required > 0 and min_diff >= required
+        elif reward_type == 4:
+            if 2001 <= task_id <= 2008:
+                can_claim = min_diff >= task_id - 2000
+            elif 2011 <= task_id <= 2018:
+                can_claim = max_diff1 >= task_id - 2010
+            elif 2021 <= task_id <= 2028:
+                can_claim = max_diff2 >= task_id - 2020
+
+        if not can_claim:
+            continue
+        grant_rewards(user, task['rewards'])
+        claimed.append(task_id)
+        granted.extend(task['rewards'])
+    return granted
+
+
+def core_data(user: dict) -> dict:
+    """按客户端配置顺序轮换迭代校验，预告下期并只恢复当期进度。"""
+    rows = challenge_catalog()['core']
+    cycle, next_cycle, end = core_cycle_info()
+    return {'now_cycle': cycle, 'next_cycle': next_cycle,
             'refresh_timestamp': end, 'max_score_info': {},
+            'reward_list': core_claimed_task_ids(user, cycle),
             'stage_info': [{'id': row['id'], 'sign': 1,
                             'min_time': progress(user, 67, row['id'])['best_time'] * 1000}
                            for row in rows if row['cycle'] == cycle
                            and progress(user, 67, row['id']).get('clear_times')]}
+
+
+def mythic_final_teams(final: dict) -> list[list[int]]:
+    """按 team_num 还原终末黑区实际队伍；官服 Ω 1-19 为 1 队，20-30 为 2 队。"""
+    team_num = int(final.get('team_num') or 1)
+    groups = [list(group) for group in (final.get('stage_list') or []) if group]
+    if not groups:
+        return []
+    if team_num <= 1:
+        return [[groups[0][0]]]
+    if len(groups) == 1:
+        return [[stage] for stage in groups[0][:team_num]]
+    # 20/25/27/30 的配置有 4 组冗余行，官服 44021 实际下发第二组两关。
+    return [[stage] for stage in groups[1][:team_num]]
 
 
 def challenge_pushes(user: dict) -> list[tuple]:
@@ -337,44 +784,61 @@ def challenge_pushes(user: dict) -> list[tuple]:
     from .abyss import abyss_data
     c = challenge_catalog()
     refresh = int(time.time()) + 7*86400
-    normal = next((x for x in c['mythic'] if x['id'] == user.get('mythic_difficulty', 1)), c['mythic'][0])
+    normal = next((x for x in c['mythic'] if x['id'] == user.get('mythic_difficulty', 1)), None)
     final_id = user.get('mythic_final_difficulty', 1)
     final = next(x for x in c['final'] if x['id'] == final_id)
     runs = user.get('mythic_final_runs', {}).get(str(final_id), {})
     difficulties = []
-    for x in c['mythic']:
-        stages = c['mythic_stages']
+    # BattleMythicStageCfg.all 是多个玩法的混合表；黑区本体固定为 3026001..3026013
+    # 主关卡 + 3027001..3027039 子关卡，不能把整张表按难度轮换，否则每个难度都会
+    # 指向同一组 3026001..3026004，客户端按 MythicPartitionCfg 校验时直接报内部错误。
+    stages = c['mythic_stages']
+    main_stages = [x for x in stages if 3026000 < x < 3026014]
+    sub_stages = [x for x in stages if 3027000 < x < 3027040]
+    for index, x in enumerate(c['mythic']):
+        main_stage = main_stages[index] if index < len(main_stages) else x['main_partition']
+        offset = index * 3
+        sub_ids = sub_stages[offset:offset + 3]
         difficulties.append({'difficulty': x['id'],
-                             'main_partition': {'partition': x['main_partition'], 'stage_id': stages[0]},
-                             'sub_partition_list': [{'partition': id, 'stage_id': stages[(i+1) % len(stages)]}
+                             'main_partition': {'partition': x['main_partition'], 'stage_id': main_stage},
+                             'sub_partition_list': [{'partition': id, 'stage_id': sub_ids[i]}
                                                     for i, id in enumerate(x['sub_partition_list'])]})
-    initial = user.get('account_template') == 'normal'
-    unlocked_mythic = ([c['mythic'][0]['id']] if initial else [x['id'] for x in c['mythic']] + [1001])
+    initial = user.get('account_template') == 'normal' and not user.get('official_unlock')
+    unlocked_mythic = ([c['mythic'][0]['id']] if initial else
+                       [1001] + [x['id'] for x in reversed(c['mythic'])])
     unlocked_final = [c['final'][0]['id']] if initial else [x['id'] for x in c['final']]
     return [
         (42001, enchantment_data(user)),
         *exploration_pushes(user),
-        (35011, {'stage_id': c['seizure'][0], 'challenge_rate': 1,
-                 'affix_info': {'refresh_timestamp': refresh}, 'refresh_timestamp': refresh}),
+        (35011, seizure_data(user)),
         (41001, tower_progress(user)),
         *boss_data(user),
-        (44007, {'difficulty_list': difficulties, 'superiority_affix_list': c['mythic_affixes'],
+        (44007, {'difficulty_list': difficulties,
+                 'superiority_affix_list': c['mythic_affixes'],
+                 'inferiority_affix_list': [{'id': 127, 'level': 3, 'type': 0},
+                                            {'id': 231, 'level': 1, 'type': 3},
+                                            {'id': 257, 'level': 1, 'type': 3}],
+                 'mythic_ultimate_affix_list': [{'id': 442, 'level': 7, 'type': 0},
+                                                {'id': 9692, 'level': 1, 'type': 0},
+                                                {'id': 9684, 'level': 1, 'type': 3}],
+                 'recommend_team': [2, 3],
                  'next_refresh_timestamp': refresh}),
         (44009, {'clear_partition_id_list': [int(key.split(':')[1])
                     for key, value in user.get('battle_progress', {}).items()
                     if key.startswith('11:') and value.get('clear_times')],
-                 'main_partition_star_list': progress(user, 11, normal['main_partition']).get('stars', []),
-                 'star_reward_provide_list': user.get('mythic_star_rewards', {}).get(str(normal['id']), [])}),
+                 'main_partition_star_list': progress(user, 11, normal['main_partition']).get('stars', []) if normal else [],
+                 'star_reward_provide_list': user.get('mythic_star_rewards', {}).get(str(normal['id']), []) if normal else []}),
         (44019, {'open_difficulty_list': unlocked_mythic,
                  'difficulty': user.get('mythic_difficulty', 1), 'is_new_difficulty': False}),
-        (44021, {'stage_list': [{'difficulty_id': x['id'], 'stage_id': [s[0] for s in x['stage_list']]}
-                               for x in c['final']]}),
+        (44021, {'stage_list': [{'difficulty_id': x['id'],
+                                 'stage_id': [team[0] for team in mythic_final_teams(x)]}
+                                for x in c['final']]}),
         (44023, {'difficulty_id_can_choose': unlocked_final, 'now_difficulty': final_id,
-                 'is_new_difficulty': False, 'receive_reward': user.get('mythic_final_rewards', []),
-                 'clear_list': user.get('mythic_final_cleared', []),
-                 'challenge_info': [{'team_id': i, 'clear_state': int(all(s in runs.get(str(i), {}).get('stages', []) for s in stages)),
+                 'is_new_difficulty': False, 'receive_reward': user.get('mythic_final_rewards') or [],
+                 'clear_list': user.get('mythic_final_cleared') or [],
+                 'challenge_info': [{'team_id': i, 'clear_state': int(final_id in (user.get('mythic_final_cleared') or []) or all(s in runs.get(str(i), {}).get('stages', []) for s in team)),
                                      'use_time': runs.get(str(i), {}).get('use_time', 0)}
-                                    for i, stages in enumerate(final['stage_list'], 1)]}),
+                                    for i, team in enumerate(mythic_final_teams(final), 1)]}),
         (55001, abyss_data(user)),
         (75009, core_data(user)),
         (18001, polyhedron_data(user)),

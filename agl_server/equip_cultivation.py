@@ -102,13 +102,27 @@ def strengthen(user: dict, equip: dict, request: dict, one_key: bool) -> dict:
     consumed = removable_equips(user, request['equip_list'], equip['equip_id'])
     gain = sum(int(e['exp']*0.8)+settings['base_exp_equip_star'][reward_item(e['prefab_id'])['equip']['starlevel']-1]
                for e in consumed)
+    print(f"[刻印强化] equip={equip['equip_id']} prefab={equip['prefab_id']} "
+          f"one_key={one_key} target={target} steps={steps} mats={request.get('mat_list')}")
     costs = []
     for row in request['mat_list']:
-        cfg_item = read_client_data(f"require('ItemCfg')[{int(row['id'])}] or {{}}")
-        if cfg_item.get('sub_type') != 608 or row['num'] <= 0:
-            raise ValueError('刻印强化材料无效')
-        gain += cfg_item['param'][0]*row['num']
-        costs.append({'id': row['id'], 'num': row['num']})
+        item_id = int(row['id'])
+        count = int(row['num'])
+        # 快速选择会把未使用的候选槽位一起带来，官方按 0 忽略。
+        if count <= 0:
+            continue
+        cfg_item = read_client_data(f"require('ItemCfg')[{item_id}] or {{}}")
+        # 605 是灵泉萃取液（突破材料），客户端把它放进 mat_list 仅用于显示；
+        # 实际消耗以 break_cost 配置为准，不能当作经验材料拒绝。
+        if cfg_item.get('sub_type') == 605:
+            continue
+        if cfg_item.get('sub_type') != 608:
+            raise ValueError(f"刻印强化材料无效: {item_id}")
+        params = cfg_item.get('param') or []
+        if not params:
+            raise ValueError(f"刻印强化材料参数缺失: {item_id}")
+        gain += params[0]*count
+        costs.append({'id': item_id, 'num': count})
     limit = catalog['exp'][str(target)][f"exp_sum_{cfg['starlevel']}"]
     needed = limit-equip['exp']
     if gain <= 0 or (one_key and gain < needed):

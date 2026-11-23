@@ -6,17 +6,23 @@ from .hero_training_data import owned_hero, total_skill_level, training_catalog
 
 
 def combo_info(user: dict, combo_id: int) -> dict:
-    """恢复连携奥义等级及独立条件进度，未培养的连携从零阶开始。"""
+    """恢复连携奥义等级及独立条件进度；未培养时仅供内部判定，不下发客户端。"""
     saved = user.get('combo_skills', {}).get(str(combo_id), {})
     return {'id': combo_id, 'level': saved.get('level', 0),
             'progress_list': [{'id': int(i), 'times': n} for i, n in saved.get('progress', {}).items()]}
 
 
 def training_initial_pushes(user: dict) -> list[tuple]:
-    """登录恢复连携等级、每日礼物置换限额与关系故事领奖事实。"""
+    """登录恢复已培养的连携等级、每日礼物置换限额与关系故事领奖事实。"""
     heroes = {h['id'] for h in user.get('heroes', []) if h.get('unlock', 1)}
-    combos = [combo_info(user, int(i)) for i, cfg in training_catalog()['ComboSkillCfg'].items()
-              if all(h in heroes for h in cfg['cooperate_role_ids'])]
+    combos = []
+    for i, cfg in training_catalog()['ComboSkillCfg'].items():
+        if not all(h in heroes for h in cfg['cooperate_role_ids']):
+            continue
+        info = combo_info(user, int(i))
+        # 客户端 description.csv 没有 level 0 条目；官服也只下发已培养的连携。
+        if info['level'] > 0:
+            combos.append(info)
     return [(73001, {'info': {'skill_list': combos}}), (73005, exchange_data(user)),
             (73007, {'got_reward_id_list': user.get('relation_story_rewards', [])})]
 
@@ -116,5 +122,8 @@ def training_battle_pushes(user: dict) -> list[tuple]:
     pushes = [(14007, {'hero': h}) for h in rows if h['hero_base_info']['id'] in ids]
     combo = battle['common'].get('cooperate_unique_skill_id', 0)
     if str(combo) in user.get('combo_skills', {}):
-        pushes.append((73003, {'skill': combo_info(user, combo)}))
+        info = combo_info(user, combo)
+        # 0 级没有 description.csv 描述，不能推给客户端；升级成功后会走 73018 的 73003。
+        if info['level'] > 0:
+            pushes.append((73003, {'skill': info}))
     return pushes

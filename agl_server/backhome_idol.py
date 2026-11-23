@@ -1,12 +1,14 @@
 """偶像训练、PVE与本机玩家挑战、回放和任务等级奖励。"""
 
 from copy import deepcopy
+import random
 import time
 
 from .backhome_catalog import archive_id, backhome_catalog, home_config, home_hero
 from .backhome_data import backhome_state
 from .backhome_idol_battle import generate_idol_battle, idol_actor
 from .battle_rewards import grant_rewards, spend_items
+from .currency_data import build_currency_balances
 from .hero_training_data import item_cost, training_catalog
 from .local_social import local_user, local_users, public_profile
 
@@ -175,20 +177,35 @@ def finish_idol_battle(user: dict, request: dict) -> dict:
 
 
 def rank_reward(user: dict, request: dict) -> dict:
-    """偶像阶段奖励按实际配置付费、自选数量、可选道具和领取事实校验。"""
+    """贴票积分档位奖励：1~3档随机碎片，4档自选，按 Alpha 口径校验。"""
     state = backhome_state(user)['idol']
-    cfg = home_config('IdolTraineeRewardRankCfg', request['id'])
-    if cfg['id'] in state['get_id_list']:
-        raise ValueError('偶像阶段奖励已经领取')
-    if cfg['id'] > 1 and cfg['id'] - 1 not in state['get_id_list']:
-        raise ValueError('偶像阶段前置奖励尚未领取')
-    rows = request['select_list']
-    if not rows or any(r['id'] not in cfg['reward'] or r['num'] <= 0 for r in rows) or sum(r['num'] for r in rows) != cfg['num']:
-        raise ValueError('偶像自选奖励或数量无效')
+    rank_id = int(request.get('id') or 0)
+    if rank_id not in (1, 2, 3, 4):
+        return {'result': 2, 'get_id_list': list(state['get_id_list']), 'reward_list': []}
+    cfg = home_config('IdolTraineeRewardRankCfg', rank_id)
+    if rank_id in state['get_id_list']:
+        return {'result': 402, 'get_id_list': list(state['get_id_list']), 'reward_list': []}
+    ticket_cost, ticket_need = cfg['item_id']
+    if build_currency_balances(user).get(ticket_cost, 0) < ticket_need:
+        return {'result': 2, 'get_id_list': list(state['get_id_list']), 'reward_list': []}
+    rows = request.get('select_list') or []
+    if rank_id == 4:
+        valid = [{'id': int(r['id']), 'num': int(r['num'])} for r in rows
+                 if int(r.get('id') or 0) in cfg['reward'] and int(r.get('num') or 0) > 0]
+        if sum(r['num'] for r in valid) == cfg['num']:
+            rewards = valid
+        else:
+            rewards = [{'id': random.choice(cfg['reward']), 'num': cfg['num']}]
+    else:
+        rewards = [{'id': random.choice(cfg['reward']), 'num': cfg['num']}]
     spend_items(user, item_cost([cfg['item_id']]))
-    grant_rewards(user, rows)
-    state['get_id_list'].append(cfg['id'])
-    return {'result': 0, 'get_id_list': list(state['get_id_list']), 'reward_list': deepcopy(rows)}
+    grant_rewards(user, rewards)
+    if rank_id == 4:
+        state['get_id_list'] = []
+    else:
+        state['get_id_list'].append(rank_id)
+    print(f"[贴票档位] id={rank_id} reward={rewards} get_id_list={state['get_id_list']}")
+    return {'result': 0, 'get_id_list': list(state['get_id_list']), 'reward_list': deepcopy(rewards)}
 
 
 def idol_history(user: dict) -> list:

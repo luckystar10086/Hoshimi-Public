@@ -11,6 +11,7 @@ from .battle_progress import stage_progress, hero_teaching
 from .daily_progress import daily_pushes
 from .mult_heart_demon import mult_heart_demon_pushes
 from .passport_progress import passport_rewards
+from .recommend_equip_data import RECOMMEND_EQUIP
 
 
 @lru_cache(maxsize=1)
@@ -95,7 +96,8 @@ def task_data(user: dict) -> dict:
             continue
         entry = saved.get(str(cfg["id"]), {})
         tasks.append({"id": cfg["id"], "progress": entry.get("progress", 0),
-                      "complete_flag": entry.get("complete_flag", 0)})
+                      "complete_flag": entry.get("complete_flag", 0),
+                      "expired_timestamp": int(entry.get("expired_timestamp") or 0)})
     return {"send_type": 0, "newbie_phase": 1, "assignment_phase": 1, "assignment_list": tasks}
 
 
@@ -103,7 +105,29 @@ def task_points(user: dict) -> dict:
     """补齐日、周和新手活跃度，防止任务奖励控件索引空数据。"""
     saved = user.get("task_points", {})
     return {"pt_list": [{"activity_pt_id": id, "active_point": saved.get(str(id), {}).get("point", 0),
-                         "get_id_list": saved.get(str(id), {}).get("claimed", [])} for id in (1, 2, 3)]}
+                         "get_id_list": sorted(int(x) for x in saved.get(str(id), {}).get("claimed", []))
+                         } for id in (1, 3)]}
+
+
+def recommend_equip_data() -> dict:
+    """培养攻略推荐数据，结构对应 sc_12097。
+
+    Alpha 在登录流里固定推送这一帧；客户端用它初始化刻印、神格等推荐页。
+    缺少该帧时，培养攻略里只有本地配置驱动的跃迁和队伍有内容。
+    """
+    def group(key: str) -> list[dict]:
+        result = []
+        for hero_id, entry in sorted(RECOMMEND_EQUIP.items()):
+            rates = [{"rate": rate, "id_list": list(ids)} for rate, ids in entry.get(key, [])]
+            if rates:
+                result.append({"id": hero_id, "rate_list": rates})
+        return result
+
+    return {
+        "astro": group("astro"),
+        "common_equip": group("common_equip"),
+        "omega_equip": group("omega_equip"),
+    }
 
 
 def equip_battle_data(user: dict) -> dict:
@@ -191,6 +215,9 @@ def battle_progress_pushes(user: dict, stage_type: int) -> list[tuple]:
     elif stage_type == 93:
         from .neural_matrix import neural_data, neural_state
         data = [(89801, neural_data(user)), (89811, {'score': neural_state(user)['last_score']})]
+    elif stage_type == 53:
+        from .challenge_data import seizure_data
+        data = [(35011, seizure_data(user))]
     elif stage_type == 8:
         from .challenge_data import enchantment_data
         data = [(24009, story_progress(user)), (42001, enchantment_data(user))]

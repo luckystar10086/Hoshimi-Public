@@ -76,6 +76,9 @@ def stage_config(stage_type: int, stage_id: int) -> dict:
 def start_battle(user: dict, request: dict, max_times: int = 5) -> tuple[dict, dict]:
     """校验当前关卡、深阱角色占用及所选队伍；扫荡可放宽倍率上限。"""
     common = deepcopy(request['common_info'])
+    if common['type'] == 35:
+        print(f"[黑区请求] dest={common.get('dest')} 英雄数={len(common.get('hero_list') or [])} "
+              f"难度={user.get('mythic_final_difficulty')}", flush=True)
     if common['type'] == 1003:
         from .abyss import prepare_abyss_battle
         abyss = prepare_abyss_battle(user, common)
@@ -83,18 +86,23 @@ def start_battle(user: dict, request: dict, max_times: int = 5) -> tuple[dict, d
         from .challenge_data import validate_enchant_stage
         validate_enchant_stage(user, common['dest'])
     if common['type'] == 35:
-        from .challenge_data import challenge_catalog
+        from .challenge_data import challenge_catalog, mythic_final_teams
         difficulty = user.get('mythic_final_difficulty', 1)
         final = next((c for c in challenge_catalog()['final'] if c['id'] == difficulty), None)
+        teams = mythic_final_teams(final) if final else []
         index = common['dest']
-        if final is None or not 1 <= index <= len(final['stage_list']):
+        # 1-19 级为单队直达选人，客户端可能下发 0、难度号或关卡号而不是队伍 1。
+        if final is not None and len(teams) == 1 and index != 1:
+            index = 1
+        if final is None or not 1 <= index <= len(teams):
             raise ValueError('终末黑区队伍序号无效')
-        stages = final['stage_list'][index-1]
+        stages = teams[index-1]
         cleared = user.get('mythic_final_runs', {}).get(str(difficulty), {}).get(str(index), {}).get('stages', [])
         stage_id = next((s for s in stages if s not in cleared), None)
         if stage_id is None:
             raise ValueError('该队伍路线已通关，请重置后重试')
         cfg = stage_config(35, stage_id)
+        print(f"[黑区开战] dest={common['dest']} 难度={difficulty} 队伍={index} 关卡={stage_id}", flush=True)
     else:
         actual_dest = common['dest']
         if common['type'] == 78:
@@ -210,6 +218,7 @@ def start_battle(user: dict, request: dict, max_times: int = 5) -> tuple[dict, d
         battle['neural'] = neural
     if common['type'] == 35:
         battle['final_difficulty'] = difficulty
+        battle['final_team_index'] = index
     if common['type'] == 82:
         run = validate_demon_battle(user, common)
         battle['demon_serial'] = run['serial']
@@ -267,6 +276,11 @@ def settle_battle(user: dict, battle: dict, battle_id: int) -> dict:
     if battle['settlement'] is not None:
         return battle['settlement']
     report = battle['reported']
+    if (report is None and battle['common']['type'] == 52
+            and int(battle['common'].get('dest') or 0) == 3035199):
+        # 1-1 的 3035199 是没有敌人的整备房间，54032 可能不带战斗战果。
+        report = {'result': 1, 'info': {}}
+        battle['reported'] = report
     if report is None:
         raise ValueError('尚未收到战斗结果')
     result = min(report['result'], 3)
@@ -295,6 +309,9 @@ def settle_battle(user: dict, battle: dict, battle_id: int) -> dict:
     if common['type'] == 82:
         from .mult_heart_demon import settle_demon_battle
         settle_demon_battle(user, battle)
+    if common['type'] == 53:
+        from .challenge_data import settle_equip_seizure
+        settle_equip_seizure(user, battle, result, info)
     stars = []
     for index, condition in enumerate(battle['config'].get('three_star_need') or [], 1):
         kind = condition[0]
@@ -343,6 +360,13 @@ def settle_battle(user: dict, battle: dict, battle_id: int) -> dict:
             update_task_progress(user, 453, times)
         elif common['type'] in (10, 100):
             update_task_progress(user, 405, times, 301)
+            if common['type'] == 100:
+                # 官服公式：难度基础分 + 已选词缀分 + 关卡条件分。
+                # 30001 在难度 7 选四个 4000 分词缀即 14000 + 16000 = 30000。
+                from .challenge_data import boss_advance, boss_challenge_score
+                score = boss_challenge_score(user, int(common['index']), boss_advance(user))
+                progress['max_point'] = max(int(progress.get('max_point') or 0), score)
+                battle['boss_score'] = score
         progress['clear_times'] += times
         progress['stars'] = sorted(set(progress['stars']) | {s['star_id'] for s in stars if s['is_achieve']})
         progress['best_time'] = min(progress.get('best_time', seconds), seconds)
@@ -354,15 +378,16 @@ def settle_battle(user: dict, battle: dict, battle_id: int) -> dict:
             complete_chapter_stage(user, common['dest'])
         battle['resident_rewards'] = complete_resident_battle(user, battle, seconds, info)
         if common['type'] == 35:
-            from .challenge_data import challenge_catalog
+            from .challenge_data import challenge_catalog, mythic_final_teams
             difficulty = battle['final_difficulty']
             runs = user.setdefault('mythic_final_runs', {}).setdefault(str(difficulty), {})
-            team = runs.setdefault(str(common['dest']), {'stages': [], 'use_time': 0})
+            team_index = battle.get('final_team_index', common['dest'])
+            team = runs.setdefault(str(team_index), {'stages': [], 'use_time': 0})
             team['stages'].append(battle['config']['id'])
             team['use_time'] += seconds
             final = next(c for c in challenge_catalog()['final'] if c['id'] == difficulty)
             if all(all(s in runs.get(str(i), {}).get('stages', []) for s in stages)
-                   for i, stages in enumerate(final['stage_list'], 1)):
+                   for i, stages in enumerate(mythic_final_teams(final), 1)):
                 cleared = user.setdefault('mythic_final_cleared', [])
                 if difficulty not in cleared:
                     cleared.append(difficulty)

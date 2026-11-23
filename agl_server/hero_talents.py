@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from .battle_progress import story_progress
 from .battle_rewards import grant_rewards, spend_items
 from .hero_training_data import item_cost, skill_level, training_catalog, training_condition
 
@@ -58,7 +59,16 @@ def unlock_astrolabe(user: dict, hero: dict, request: dict) -> dict:
         raise ValueError('神格已解锁')
     if cfg['pre_astrolabe_id'] and cfg['pre_astrolabe_id'] not in unlocked:
         raise ValueError('前置神格尚未解锁')
-    if not training_condition(user, hero, cfg['unlock_condition']):
+    condition_id = cfg['unlock_condition']
+    condition = catalog['ConditionCfg'].get(str(condition_id), {})
+    if condition.get('type') == 1011:
+        # 神格界面按登录剧情进度判断，预设通关记录也算，不能只看 battle_progress。
+        stage = condition['params'][0]
+        eligible = any(row['id'] == stage and row.get('clear_times', 0) > 0
+                       for row in story_progress(user)['user_chapter_list'])
+    else:
+        eligible = training_condition(user, hero, condition_id)
+    if not eligible:
         raise ValueError('神格解锁条件未满足')
     spend_items(user, item_cost(cfg['unlock']))
     unlocked.append(node)

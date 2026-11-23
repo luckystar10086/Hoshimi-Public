@@ -39,8 +39,11 @@ from .supply_data import build_supply_goods
 from .gameplay_data import build_gameplay_pushes, passport_data, equip_battle_data, battle_progress_pushes
 from .gameplay_protocol import encode_message, decode_message, message_has_field
 from .battle_data import start_battle, settle_battle, start_story
+from .achievement_story import login_story_line, read_achievement_story
 from .challenge_data import (boss_data, enchantment_data, challenge_pushes,
-                            refresh_enchantment)
+                            core_data, claim_core_rewards,
+                            refresh_enchantment, seizure_data,
+                            claim_equip_seizure_rewards)
 from .battle_udp import BattleUDP
 from .reserve_data import save_reserve, save_battle_team
 from .profile_data import profile_data, profile_request, PROFILE_COMMANDS
@@ -53,7 +56,7 @@ from .backhome_requests import BACKHOME_COMMANDS, BACKHOME_ONEWAY_COMMANDS, back
 from .backhome_data import backhome_state
 from .local_social import recommend_friends
 from .task_progress import refresh_task_periods, update_task_progress, claim_tasks, claim_task_points
-from .gameplay_data import task_data, task_points
+from .gameplay_data import task_data, task_points, recommend_equip_data
 from .shop_transactions import buy_goods, shop_stock, refresh_shop_periods
 from .loadout_storage import LOADOUT_COMMANDS, loadout_request, servant_data, chip_data
 from .passport_progress import passport_request
@@ -520,6 +523,7 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 session.battle = user.get('battle_session')
             balances = build_currency_balances(user)
             heroes = user["heroes"]
+            guide_recommend = recommend_equip_data()
             supplies = build_supply_goods()
             shop_goods = dict(SHOP_GOODS_NOREFRESH)
             for sid, goods in supplies.items():
@@ -554,6 +558,11 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 *[(c, encode_message(c, v), 0, 0.0) for c, v in sign_pushes(user) + chapter_map_pushes(user)],
                 (12011, bridge.encode_sc_12011(user.get('finished_guides')), 0, 0.0),
                 (12111, bridge.encode_sc_12111(user.get('finished_weak_guides')), 0, 0.0),
+                # 培养攻略推荐：客户端 sc_12097 初始化刻印/神格等推荐页。
+                # 之前未下发时，只有本地 HeroCfg 驱动的跃迁和队伍两个页签有内容。
+                # 12099 为空 hide_list，表示不隐藏任何推荐条目。
+                (12099, encode_message(12099, {'hide_list': []}), 0, 0.0),
+                (12097, encode_message(12097, guide_recommend), 0, 0.0),
                 # 该推送只需要登录用户自身的字段；session 为 None 的探测路径没有会话对象，
                 # 直接读 session 会抛 AttributeError，因此统一以已装载的 user 读取。
                 (28837, bridge.encode_sc_28837(user.get('qworld_unlocked_functions', [])), 0, 0.0),
@@ -563,6 +572,12 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 (32051, encode_message(32051, {'list': [
                     {'skin_id': i, 'gift_acquire': True} for i in user.get('skin_gifts', [])]}), 0, 0.0),
                 (12001, encode_message(12001, {'story_list': user.get('read_stories', [])}), 0, 0.0),
+                # 成就物语已读列表：客户端登录时用 sc_53001.story_line 初始化
+                # AchievementData.storyReadList_，不下发就会每次登录全部变回红点。
+                (53001, encode_message(53001, {
+                    'achievement_list': [],
+                    'story_line': login_story_line(user),
+                }), 0, 0.0),
                 (12033, encode_message(12033, user.get('birthday', {'month': 0, 'day': 0})), 0, 0.0),
                 (10600, bridge.encode_sc_10600(), 0, 0.0),
                 (24009, encode_message(24009, story_progress(user)), 0, 0.0),
@@ -576,6 +591,8 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
             ]
             user_mgr.save_user(user)
             print(f"[服务端] 已生成 sc_10043，UID={user['uid']} + 数据推送")
+            print(f"[培养攻略] 下发 sc_12099/12097：astro={len(guide_recommend['astro'])} "
+                  f"common_equip={len(guide_recommend['common_equip'])} omega_equip={len(guide_recommend['omega_equip'])}")
         elif cmd in ONLINE_COMMANDS:
             resp_cmd = cmd + 1
             try:
@@ -993,6 +1010,14 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 print(f'[古远虚影拒绝] 指令={cmd} {error}')
                 resp_before = []
                 resp_pb = encode_message(resp_cmd, {'result': 1})
+        elif cmd == 69002:
+            # 黑区 Ω / 排行榜页会查询通用榜单；没有真实榜单时回空列表，
+            # 不能落到“未实现”返回 result=1，否则页面会弹服务器内部错误。
+            request = decode_message(cmd, pb_payload)
+            print(f"[排行榜请求] 指令=69002 rank_id={request.get('rank_id')}", flush=True)
+            resp_cmd = 69003
+            resp_pb = encode_message(69003, {'result': 0, 'children_rank_list': []})
+            resp_extra = []
         elif cmd in POLYHEDRON_COMMANDS:
             from copy import deepcopy
             resp_cmd = cmd + 1
@@ -1003,7 +1028,9 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 values = polyhedron_request(user, cmd, decode_message(cmd, pb_payload))
                 resp_pb = encode_message(resp_cmd, values)
                 data = polyhedron_data(user)
-                resp_before = [(18001, encode_message(18001, data))]
+                # 66038 只是设置连携奥义，官服不跟 18001 状态推送；
+                # 多发会把客户端刚开始的挑战流程重置成转圈。
+                resp_before = [] if cmd == 66038 else [(18001, encode_message(18001, data))]
                 if data['game']['state'] == 3:
                     resp_before.append((18005, encode_message(18005, {'end_info': user.get('polyhedron_settlement', {})})))
                 resp_extra = [(c, encode_message(c, v), 0, 0.0) for c, v in inventory_pushes(user)]
@@ -1017,11 +1044,13 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
         elif cmd in CHALLENGE_COMMANDS:
             from copy import deepcopy
             resp_cmd = cmd + 1
+            request = decode_message(cmd, pb_payload)
+            print(f"[挑战请求] 指令={cmd} 请求={request}", flush=True)
             try:
                 if not session or not session.user_data:
                     raise ValueError('未登录')
                 user = deepcopy(session.user_data)
-                values = challenge_request(user, cmd, decode_message(cmd, pb_payload))
+                values = challenge_request(user, cmd, request)
                 resp_pb = encode_message(resp_cmd, values)
                 if 55000 <= cmd < 55100:
                     from .abyss import abyss_data
@@ -1137,8 +1166,27 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 if not session:
                     raise ValueError('未登录')
                 user = deepcopy(session.user_data)
-                values = hero_request(user, cmd, decode_message(cmd, pb_payload))
+                request = decode_message(cmd, pb_payload)
+                values = hero_request(user, cmd, request)
                 resp_pb = encode_message(resp_cmd, values)
+                if cmd in (13012, 13026) and values.get('result') is not None:
+                    # 刻印穿戴/一键穿戴后必须同步角色槽位；客户端收到 14007 才会刷新
+                    # HeroData 的 equip_ids，缺失时会弹“服务器内部错误”。
+                    # 13012 可能把刻印从别的角色身上抢过来，因此按 equip_ids 差异
+                    # 找出所有受影响角色；请求角色本身即使没变也要回一帧。
+                    old_ids = {h['id']: tuple(h.get('equip_ids', []))
+                               for h in session.user_data.get('heroes', [])}
+                    rows = hero_info_data(user)['hero_info_list']
+                    changed_ids = {h['hero_base_info']['id'] for h in rows
+                                   if old_ids.get(h['hero_base_info']['id'])
+                                   != tuple(e['equip_id'] for e in h.get('equip', []))}
+                    target_ids = changed_ids | {request.get('hero_id', 0)}
+                    push_heroes = [h for h in rows if h['hero_base_info']['id'] in target_ids]
+                    if push_heroes:
+                        # 必须排在 sc_13013/sc_13027 之前，客户端回调读取最新槽位。
+                        resp_before = [(14007, encode_message(14007, {'hero': h})) for h in push_heroes]
+                        print(f'[刻印刷新] 指令={cmd} 下发 sc_14007 '
+                              f'hero={[h["hero_base_info"]["id"] for h in push_heroes]}')
                 if cmd == 71108 and values.get('reward_list'):
                     # 逸闻奖励弹窗不更新碎片缓存，首领奖后同步权威库存。
                     pieces = [{'id': int(i), 'num': n}
@@ -1220,6 +1268,73 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 user_mgr.save_user(user)
             resp_cmd = 14035
             resp_pb = bridge.encode_sc_14035(result=0 if valid else 1)
+        elif cmd == 14032:
+            from copy import deepcopy
+            from .fragment_exchange import resolve_fragments
+            resp_cmd = 14033
+            try:
+                if not session or not session.user_data:
+                    raise ValueError('未登录')
+                user = deepcopy(session.user_data)
+                result = resolve_fragments(user)
+                resp_pb = encode_message(resp_cmd, {'result': 0})
+                pieces = [{'id': int(i), 'num': n}
+                          for i, n in user.get('hero_pieces', {}).items()]
+                # sc_17023 的 normal_items 是“当前余额”，不是本次增量；
+                # 之前传 result['mid'] 会把客户端的 40901 覆盖成本次产出（如 250）。
+                balances = build_currency_balances(user)
+                normal_items = [{'id': i, 'num': balances.get(i, 0)}
+                                for i in (40901, 40902) if i in balances]
+                pushes = inventory_pushes(user) + [
+                    (14019, {'piece_list': pieces}),
+                    (17023, {'normal_items': normal_items}),
+                ]
+                resp_extra = [(c, encode_message(c, v), 0, 0.0) for c, v in pushes]
+                get_user_manager().save_user(user)
+                session.user_data = user
+                print(f"[服务端] cs_14032 情报兑换完成：中级={result['mid']} 高级={result['adv']}")
+            except ValueError as error:
+                print(f'[情报兑换拒绝] {error}')
+                resp_extra = None
+                resp_pb = encode_message(resp_cmd, {'result': 1})
+        elif cmd == 75006:
+            from copy import deepcopy
+            resp_cmd = 75007
+            try:
+                if not session or not session.user_data:
+                    raise ValueError('未登录')
+                user = deepcopy(session.user_data)
+                request = decode_message(cmd, pb_payload)
+                granted = claim_core_rewards(user, request.get('reward_list') or [])
+                resp_pb = encode_message(resp_cmd, {'result': 0,
+                                                   'reward_list': granted})
+                pushes = inventory_pushes(user) + [(75009, core_data(user))]
+                resp_extra = [(c, encode_message(c, v), 0, 0.0) for c, v in pushes]
+                get_user_manager().save_user(user)
+                session.user_data = user
+                print(f"[服务端] cs_75006 迭代校验领取完成：任务={request.get('reward_list')} "
+                      f"实际发放={granted}")
+            except ValueError as error:
+                print(f'[迭代校验领取拒绝] {error}')
+                resp_extra = None
+                resp_pb = encode_message(resp_cmd, {'result': 1})
+        elif cmd == 53006:
+            from copy import deepcopy
+            resp_cmd = 53007
+            try:
+                if not session or not session.user_data:
+                    raise ValueError('未登录')
+                user = deepcopy(session.user_data)
+                request = decode_message(cmd, pb_payload)
+                values = read_achievement_story(user, request.get('id') or 0)
+                resp_pb = encode_message(resp_cmd, values)
+                get_user_manager().save_user(user)
+                session.user_data = user
+                print(f"[服务端] cs_53006 成就物语已读：id={request.get('id')} 结果={values['result']}")
+            except ValueError as error:
+                print(f'[成就物语拒绝] {error}')
+                resp_extra = None
+                resp_pb = encode_message(resp_cmd, {'result': 1})
         elif cmd == 10200:  # cs_10200 -> sc_10201
             resp_cmd = 10201
             resp_pb = bridge.encode_sc_10201()
@@ -1291,8 +1406,16 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
         elif cmd in (45202, 44010, 44016):
             user = session.user_data if session else {}
             request = decode_message(cmd, pb_payload)
+            print(f"[模式请求] 指令={cmd} 请求={request}", flush=True)
             if cmd == 45202:
-                user['boss_mode'] = request['select']
+                select = request['select']
+                if select in (101, 102):
+                    user['boss_advance_id'] = select
+                    user['boss_mode'] = 1 if select == 101 else 2
+                else:
+                    user['boss_mode'] = select
+                    if select in (1, 2):
+                        user['boss_advance_id'] = 100 + select
                 pushes = boss_data(user)
             else:
                 if cmd == 44016:
@@ -1313,7 +1436,12 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 if not session:
                     raise ValueError('未登录')
                 user = deepcopy(session.user_data)
-                battle, player = start_battle(user, decode_message(cmd, pb_payload), max_times=10)
+                request = decode_message(cmd, pb_payload)
+                common = request.get('common_info') or {}
+                # 官服 1-1 的 3035199 是“战前整备”房间：仍会走
+                # 54030 -> 54031/54003/54007 进入场景，但不是战斗层。
+                # prepare_battle 对 9001/9002 的 3035199 放行 save_point=2。
+                battle, player = start_battle(user, request, max_times=10)
                 player_pb = encode_message(54003, player)
                 if battle['common']['type'] == 78:
                     from .rogue_team import rogue_battle_pushes
@@ -1370,6 +1498,16 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 user['battle_session'] = battle
                 resp_pb = encode_message(resp_cmd, values)
                 resp_extra = [(c, encode_message(c, v), 0, 0.0) for c, v in inventory_pushes(user)]
+                if battle['common']['type'] == 53:
+                    # 35013 必须先于 54033 到达：结算页在 54033 回调里读 GetResultScore，
+                    # 晚到会读到 0，圆环就退回显示战斗时长。
+                    seizure = battle.get('seizure_settlement') or {}
+                    resp_before = [(35013, encode_message(35013, {
+                        'is_valid': bool(seizure.get('is_valid')),
+                        'score': int(seizure.get('score') or 0),
+                        'today_max_score': int(seizure.get('today_max_score') or 0),
+                        'sum_score': int(seizure.get('sum_score') or 0),
+                    }))]
                 resp_extra += battle_progress_pushes(user, battle['common']['type'])
                 if battle['common']['type'] == 1003:
                     # 结算回调立即读取深阱分数和首领阶段，必须先到达客户端。
@@ -1395,6 +1533,28 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
                 resp_before = []
                 resp_extra = None
                 resp_pb = encode_message(resp_cmd, {'result': 1})
+        elif cmd == 35014:
+            from copy import deepcopy
+            resp_cmd = 35015
+            try:
+                if not session:
+                    raise ValueError('未登录')
+                user = deepcopy(session.user_data)
+                request = decode_message(cmd, pb_payload)
+                values = claim_equip_seizure_rewards(
+                    user, request.get('id_list') or [])
+                resp_pb = encode_message(resp_cmd, values)
+                resp_extra = [(c, encode_message(c, v), 0, 0.0)
+                              for c, v in inventory_pushes(user)]
+                resp_extra.append((35011, encode_message(35011, seizure_data(user)), 0, 0.0))
+                session.user_data = user
+                get_user_manager().save_user(user)
+                print(f'[介质攫取领奖] 档位={request.get("id_list") or []} '
+                      f'获得={values.get("reward_list") or []}')
+            except (ValueError, KeyError) as error:
+                print(f'[介质攫取领奖拒绝] {error}')
+                resp_extra = None
+                resp_pb = encode_message(resp_cmd, {'result': 1, 'reward_list': []})
         elif cmd == 54034:
             request = decode_message(cmd, pb_payload)
             resp_cmd = 54035
@@ -1525,6 +1685,12 @@ def handle_tcp_message(opcode: int, flag: int, rpc_id: int, body: bytes, writer=
         if resp_cmd is not None and resp_pb is not None:
             out = pack_ystcp(resp_cmd, resp_pb, is_compress=0, index=c_idx, server_index=c_idx)
             out = b''.join(pack_ystcp(c, pb, index=0, server_index=0) for c, pb in resp_before) + out
+            # 官服 18010/66038 的应答会连续下发两次（如 sc_18011、sc_66039）。
+            # 客户端开始挑战的回调在部分版本里等第二次应答，补一帧避免一直转圈。
+            if cmd in (18010, 66038):
+                out += pack_ystcp(resp_cmd, resp_pb, is_compress=0, index=c_idx, server_index=c_idx)
+            print(f'[发送] cs_{cmd} -> sc_{resp_cmd} 主包={len(resp_pb)}字节 '
+                  f'前置={[c for c, _ in resp_before]}', flush=True)
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:

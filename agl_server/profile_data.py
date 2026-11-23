@@ -18,7 +18,7 @@ PROFILE_FIELDS = {
     32108: ('poster_background_id', 'poster_background_id'),
 }
 PROFILE_COMMANDS = set(PROFILE_FIELDS) | {
-    12002, 12026, 12030, 23012, 32038, 32044, 32122, 32124, 32126, 32128, 32130, 32132, 32134, 32052, 32058,
+    12002, 12026, 12030, 23012, 32038, 32042, 32044, 32122, 32124, 32126, 32128, 32130, 32132, 32134, 32052, 32058,
 }
 
 
@@ -88,6 +88,12 @@ def profile_request(user: dict, command: int, request: dict, rewards: list | Non
     无法通过协议字段下发，调用方据此补发库存推送。
     """
     response = {'result': 0}
+    if command == 32042:
+        # 打开培养攻略/点击刻印页签时，客户端发送 cs_32042{role_id} 校验推荐刻印；
+        # 官服 Alpha 只回 sc_32043{result:0}，不修改存档。此前落到通用兜底
+        # result=1，正是点击刻印弹“服务器内部错误”的原因。
+        print(f'[培养攻略] 32042 推荐刻印校验 role_id={int(request.get("role_id") or 0)} -> result=0')
+        return response
     if command == 32044:
         # 语音界面只传角色编号，播放前校验角色已拥有且已解锁。
         # 客户端以 result=0 为成功，成功后播放本地语音文件。

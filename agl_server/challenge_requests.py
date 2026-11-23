@@ -4,11 +4,13 @@ from copy import deepcopy
 
 from .battle_progress import progress
 from .battle_rewards import drop_config, roll_drops, grant_rewards
-from .challenge_data import (boss_area, boss_group_ids, challenge_catalog,
+from .challenge_data import (boss_advance, boss_advance_pool, boss_area,
+                            boss_group_ids, challenge_catalog,
                             rogue_score_reward_ids, rogue_selection_catalog)
 
-CHALLENGE_COMMANDS = {44012, 44024, 44026, 44028, 45004, 45006, 45104,
-                      45108, 45110, 45204, 55002, 55004, 55006, 55012, 55020, 88100, 88316}
+CHALLENGE_COMMANDS = {44012, 44024, 44026, 44028, 44030, 45004, 45006, 45104,
+                      45106, 45108, 45110, 45112, 45204, 55002, 55004, 55006,
+                      55012, 55020, 88100, 88316}
 
 
 def challenge_request(user: dict, command: int, request: dict) -> dict:
@@ -41,12 +43,32 @@ def challenge_request(user: dict, command: int, request: dict) -> dict:
         elif command == 44026:
             user.setdefault('mythic_final_runs', {}).pop(str(difficulty), None)
         else:
-            claimed = user.setdefault('mythic_final_rewards', [])
-            if difficulty in claimed or difficulty not in user.get('mythic_final_cleared', []):
+            claimed = user.get('mythic_final_rewards') or []
+            user['mythic_final_rewards'] = claimed
+            # 通关高等级会同时解锁低等级奖励；官服 clear_list 只记最高档，
+            # 不能要求领取档位必须精确出现在 clear_list 里。
+            max_clear = max((int(x) for x in (user.get('mythic_final_cleared') or [])), default=0)
+            if difficulty in claimed or difficulty > max_clear:
                 raise ValueError('终末黑区未通关或已领取奖励')
             rewards = [{'id': i, 'num': n} for i, n in cfg['reward_list']]
             claimed.append(difficulty)
+            claimed.sort()
             response['item_list'] = rewards
+    elif command == 44030:
+        # 黑区奖励页“一键领取”：领取所有已通关、尚未领取的终末黑区档位。
+        cleared = user.get('mythic_final_cleared') or []
+        claimed = sorted({int(x) for x in (user.get('mythic_final_rewards') or [])})
+        user['mythic_final_rewards'] = claimed
+        # 通关 30 档等于 1~30 档全部达成；只遍历 clear_list 会漏掉低档奖励。
+        max_clear = max((int(x) for x in cleared), default=0)
+        for difficulty in range(1, max_clear + 1):
+            cfg = next((c for c in catalog['final'] if c['id'] == difficulty), None)
+            if not cfg or difficulty in claimed:
+                continue
+            rewards.extend({'id': i, 'num': n} for i, n in cfg['reward_list'])
+            claimed.append(difficulty)
+        claimed.sort()
+        response['item_list'] = rewards
     elif command in (45004, 45006):
         area = boss_area(user)
         groups = boss_group_ids(user, area)[:area['boss_nums']]
@@ -68,6 +90,32 @@ def challenge_request(user: dict, command: int, request: dict) -> dict:
                 raise ValueError('梦境星数不足或已经领奖')
             rewards = roll_drops(drop_config(drop), 1)
             claimed.append(star)
+    elif command == 45106:
+        # 单 boss 重置：清掉本次编队/词缀与战斗记录，但保留历史最高积分。
+        boss_id = request.get('boss_id', request.get('id'))
+        advance = boss_advance(user)
+        target = next((x for x in boss_advance_pool(user, advance) if x['id'] == boss_id), None)
+        if target is None:
+            raise ValueError('梦境 boss 不存在')
+        row = progress(user, 100, target['stage_id'])
+        max_point = int(row.get('max_point') or 0)
+        row.clear()
+        if max_point:
+            row['max_point'] = max_point
+        user.get('boss_affixes', {}).pop(str(boss_id), None)
+        user.get('boss_teams', {}).pop(str(boss_id), None)
+    elif command == 45112:
+        # 梦境“一键领取”：按当前模式所有 boss 最高积分之和，领取未领取过的档位。
+        advance = boss_advance(user)
+        total = sum(int(progress(user, 100, x['stage_id']).get('max_point') or 0)
+                    for x in boss_advance_pool(user, advance))
+        received = user.get('boss_receive_points') or []
+        user['boss_receive_points'] = received
+        for threshold, drop_id in advance.get('reward') or []:
+            if total >= threshold and threshold not in received:
+                rewards.extend(roll_drops(drop_config(drop_id), 1))
+                received.append(threshold)
+        response['item_list'] = rewards
     elif command in (45104, 45108, 45110):
         group = request.get('id', request.get('group_id'))
         if command == 45110:
@@ -81,8 +129,10 @@ def challenge_request(user: dict, command: int, request: dict) -> dict:
             pool = next(c for c in catalog['advance_pool'] if c['id'] == group)
             if not 1 <= request['diffculty_index'] <= len(config['monster_value']):
                 raise ValueError('梦境难度无效')
+            # 官服 45101 的 affix_index_list 存的是词缀 ID（如 99400），不是数组下标。
             for field, choices in (('affix_index_list', pool['affix_pool']), ('time_index_list', pool['time_pool'])):
-                if len(set(request[field])) != len(request[field]) or any(not 1 <= i <= len(choices) for i in request[field]):
+                values = request.get(field) or []
+                if len(set(values)) != len(values) or any(value not in choices for value in values):
                     raise ValueError('梦境词缀选项无效')
             user.setdefault('boss_affixes', {})[str(group)] = {k: deepcopy(request[k]) for k in
                 ('affix_index_list', 'time_index_list', 'diffculty_index')}

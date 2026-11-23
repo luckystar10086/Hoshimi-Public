@@ -174,18 +174,22 @@ class UserManager:
             user = self._load_json(user_file, None)
             if user:
                 from .account_defaults import restore_player_exp
+                from .save_compat import normalize_go_save
                 from .passport_progress import passport_rewards
+                migrated = normalize_go_save(user)
                 received = passport_rewards(user)
                 repaired = 'passport_rewards' in user and user['passport_rewards'] != received
-                if repaired:
+                if repaired or migrated:
                     backup_dir = USERS_DIR / 'backup'
                     backup_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(user_file, backup_dir / f'{uid}.passport-rewards-{time.time_ns()}.json')
-                    user['passport_rewards'] = received
+                    tag = 'passport-rewards' if repaired and not migrated else 'go-migrate'
+                    shutil.copy2(user_file, backup_dir / f'{uid}.{tag}-{time.time_ns()}.json')
+                    if repaired:
+                        user['passport_rewards'] = received
                 restored = restore_player_exp(user)
                 from .activity_periods import refresh_periods
                 refreshed = refresh_periods(user, self)
-                if repaired or restored or refreshed:
+                if repaired or restored or refreshed or migrated:
                     self.save_user(user)
             return user
 
