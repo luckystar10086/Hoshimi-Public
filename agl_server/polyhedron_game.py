@@ -121,9 +121,9 @@ SPECIAL_GATE_TYPES = {10001, 10002}
 BOSS_CHAPTER_LEVELS = {1: 7, 2: 8, 3: 10}
 # 第一/二章默认 2 扇门，第三章默认 3 扇门；异常节点是额外独立门，不占普通门名额。
 GATE_COUNT_BY_CHAPTER = {1: 2, 2: 2, 3: 3}
-SPECIAL_GATE_CHANCE = 1.0
-# 测试期临时 100% 生成特殊门：1-1 与各章 BOSS 节点除外，其余节点必出 1 扇。
-# 测试完恢复 0.25。
+SPECIAL_GATE_CHANCE = 0.1
+# 特殊门基础概率 10%：1-1 与各章 BOSS 节点除外，其余节点按概率生成。
+# 带有相关增益时，按下方 effect_value 叠加，上限仍为 100%。
 # 只有 1-1 保底不生成精英门；之后每扇普通门约 8% 概率替换为精英门，
 # 约 12 扇门出 1 扇。同一节点最多 1 扇精英，避免整层全紫。
 ELITE_GATE_CHANCE = 0.08
@@ -346,7 +346,7 @@ def _gate_events(tier: dict, gates: list[dict], no_recruit: bool = False,
                 chosen[slot] = random.choice(elite_choices)
                 break
     special = None
-    # 1-1 和 BOSS 节点本身不生成特殊门；测试期其余节点必出。
+    # 1-1 和 BOSS 节点本身不生成特殊门；其余节点按基础概率生成。
     allow_special = not (int(tier['tier']) == 1 and int(tier['level']) == 1)
     if allow_special and chosen and random.random() < min(1.0, SPECIAL_GATE_CHANCE + (
             max(0, effect_value(data, 4)) / 1000 if data is not None else 0)):

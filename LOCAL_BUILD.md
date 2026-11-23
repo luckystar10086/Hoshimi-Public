@@ -26,12 +26,12 @@ The branch intentionally keeps the local behavior instead of replacing it with t
 
 Create `config_local.py` locally when running this branch; it is intentionally ignored.
 
-## Test-only setting
+## Special gate rate
 
 `agl_server/polyhedron_game.py` currently has:
 
 ```python
-SPECIAL_GATE_CHANCE = 1.0
+SPECIAL_GATE_CHANCE = 0.1
 ```
 
-This is a local test setting that makes every eligible node spawn a special gate. For normal play or shared builds, change it back to `0.25` or make it configurable.
+This means a 10% base chance for an eligible node to spawn a special gate. The first stage of chapter 1 and all chapter BOSS nodes are excluded. Related in-run effects can add to the chance, capped at 100%.
